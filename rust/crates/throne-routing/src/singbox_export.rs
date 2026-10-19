@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use serde_json::{json, Map, Value};
 use crate::throne_import::Profile;
 
@@ -7,12 +8,21 @@ pub enum ConvertError {
     UnsupportedAction(usize),
     InvalidRule(usize),
     UnknownOutbound(String),
+    UnknownRuleSet(String),
 }
 
-/// Convert only explicitly supported route rules.
-/// Any unsupported rule rejects the entire profile rather than silently changing policy.
-/// The caller must supply actual configured outbound tags.
+/// A route fragment only. Rule-set definitions must be provided and validated separately.
+/// No remote URLs are inferred from names such as geosite-ru.
 pub fn convert(profile: &Profile, proxy_tag: &str, direct_tag: &str) -> Result<Value, ConvertError> {
+    convert_with_rule_sets(profile, proxy_tag, direct_tag, &HashMap::new())
+}
+
+pub fn convert_with_rule_sets(
+    profile: &Profile,
+    proxy_tag: &str,
+    direct_tag: &str,
+    rule_sets: &HashMap<String, String>,
+) -> Result<Value, ConvertError> {
     if proxy_tag.is_empty() || direct_tag.is_empty() || proxy_tag == direct_tag {
         return Err(ConvertError::UnknownOutbound("invalid outbound tags".into()));
     }
@@ -31,25 +41,24 @@ pub fn convert(profile: &Profile, proxy_tag: &str, direct_tag: &str) -> Result<V
             return Err(ConvertError::UnsupportedRule(index));
         }
         let action = obj.get("action").and_then(Value::as_str).unwrap_or("route");
-        // These keys are the complete supported input schema for this initial converter.
-        let allowed = ["name", "type", "action", "outbound", "domain", "domain_suffix", "domain_keyword", "ip_cidr", "ip_is_private"];
+        let allowed = ["name", "type", "action", "outbound", "domain", "domain_suffix",
+            "domain_keyword", "ip_cidr", "ip_is_private", "rule_set", "protocol"];
         if obj.keys().any(|key| !allowed.contains(&key.as_str())) {
             return Err(ConvertError::UnsupportedRule(index));
         }
-        if action != "route" {
-            return Err(ConvertError::UnsupportedAction(index));
-        }
-        let dest = obj.get("outbound").and_then(Value::as_str).ok_or(ConvertError::InvalidRule(index))?;
-        let tag = outbound(dest)?;
         let mut result = Map::new();
         let mut matches = 0;
-        for key in ["domain", "domain_suffix", "domain_keyword", "ip_cidr"] {
+        for key in ["domain", "domain_suffix", "domain_keyword", "ip_cidr", "protocol"] {
             if let Some(value) = obj.get(key) {
-                let list = value.as_array().ok_or(ConvertError::InvalidRule(index))?;
-                if list.is_empty() || !list.iter().all(Value::is_string) {
+                let list = if key == "protocol" && value.is_string() {
+                    vec![value.clone()]
+                } else {
+                    value.as_array().ok_or(ConvertError::InvalidRule(index))?.clone()
+                };
+                if list.is_empty() || !list.iter().all(|v| v.as_str().is_some_and(|s| !s.is_empty())) {
                     return Err(ConvertError::InvalidRule(index));
                 }
-                result.insert(key.to_string(), value.clone());
+                result.insert(key.to_string(), Value::Array(list));
                 matches += 1;
             }
         }
@@ -60,11 +69,39 @@ pub fn convert(profile: &Profile, proxy_tag: &str, direct_tag: &str) -> Result<V
             result.insert("ip_is_private".into(), value.clone());
             matches += 1;
         }
+        if let Some(value) = obj.get("rule_set") {
+            let list = value.as_array().ok_or(ConvertError::InvalidRule(index))?;
+            if list.is_empty() {
+                return Err(ConvertError::InvalidRule(index));
+            }
+            let mut resolved = Vec::new();
+            for name in list {
+                let name = name.as_str().filter(|s| !s.is_empty()).ok_or(ConvertError::InvalidRule(index))?;
+                let tag = rule_sets.get(name).filter(|s| !s.is_empty())
+                    .ok_or_else(|| ConvertError::UnknownRuleSet(name.to_owned()))?;
+                resolved.push(json!(tag));
+            }
+            result.insert("rule_set".into(), Value::Array(resolved));
+            matches += 1;
+        }
         if matches == 0 {
             return Err(ConvertError::InvalidRule(index));
         }
-        result.insert("action".into(), json!("route"));
-        result.insert("outbound".into(), json!(tag));
+        match action {
+            "route" => {
+                let dest = obj.get("outbound").and_then(Value::as_str).ok_or(ConvertError::InvalidRule(index))?;
+                result.insert("action".into(), json!("route"));
+                result.insert("outbound".into(), json!(outbound(dest)?));
+            }
+            "hijack-dns" => {
+                if obj.contains_key("outbound") || matches != 1 ||
+                    result.get("protocol") != Some(&json!(["dns"])) {
+                    return Err(ConvertError::InvalidRule(index));
+                }
+                result.insert("action".into(), json!("hijack-dns"));
+            }
+            _ => return Err(ConvertError::UnsupportedAction(index)),
+        }
         rules.push(Value::Object(result));
     }
     Ok(json!({"route": {"rules": rules, "final": final_tag}}))
@@ -89,22 +126,41 @@ mod tests {
         let out = convert(&p, "vpn", "direct").unwrap();
         assert_eq!(out["route"]["final"], "vpn");
         assert_eq!(out["route"]["rules"][0]["domain_suffix"][0], "ru");
-        assert_eq!(out["route"]["rules"][0]["outbound"], "direct");
     }
 
     #[test]
-    fn reject_unknown_rules() {
+    fn rejects_missing_rule_set_mapping() {
         let p = profile(json!({"default_outbound":"proxy","rules":[
             {"type":"custom","action":"route","outbound":"direct","rule_set":["geoip-ru"]}
         ]}));
-        assert_eq!(convert(&p, "vpn", "direct"), Err(ConvertError::UnsupportedRule(0)));
+        assert_eq!(convert(&p, "vpn", "direct"), Err(ConvertError::UnknownRuleSet("geoip-ru".into())));
     }
 
     #[test]
-    fn reject_dns_hijack_until_implemented() {
+    fn maps_rule_set_to_existing_tag() {
+        let p = profile(json!({"default_outbound":"proxy","rules":[
+            {"type":"custom","action":"route","outbound":"direct","rule_set":["geoip-ru"]}
+        ]}));
+        let mappings = HashMap::from([("geoip-ru".into(), "ru-ip".into())]);
+        let out = convert_with_rule_sets(&p, "vpn", "direct", &mappings).unwrap();
+        assert_eq!(out["route"]["rules"][0]["rule_set"], json!(["ru-ip"]));
+    }
+
+    #[test]
+    fn converts_dns_hijack_action() {
         let p = profile(json!({"default_outbound":"proxy","rules":[
             {"type":"custom","action":"hijack-dns","protocol":"dns"}
         ]}));
-        assert_eq!(convert(&p, "vpn", "direct"), Err(ConvertError::UnsupportedRule(0)));
+        let out = convert(&p, "vpn", "direct").unwrap();
+        assert_eq!(out["route"]["rules"][0]["action"], "hijack-dns");
+        assert_eq!(out["route"]["rules"][0]["protocol"], json!(["dns"]));
+    }
+
+    #[test]
+    fn rejects_unsafe_dns_hijack() {
+        let p = profile(json!({"default_outbound":"proxy","rules":[
+            {"type":"custom","action":"hijack-dns","protocol":"dns","outbound":"proxy"}
+        ]}));
+        assert_eq!(convert(&p, "vpn", "direct"), Err(ConvertError::InvalidRule(0)));
     }
 }
